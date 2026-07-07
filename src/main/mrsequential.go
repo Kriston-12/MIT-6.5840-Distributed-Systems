@@ -68,10 +68,13 @@ func main() {
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
+		// The loop below finds the first index j such that intermediate[j].Key != intermediate[i].Key
+		// which means range[i, j) contains the same key
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 			j++
 		}
 		values := []string{}
+		// Loop through the range [i, j) to collect all values for the same key
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
