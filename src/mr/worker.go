@@ -34,8 +34,11 @@ func ihash(key string) int {
 var coordSockName string // socket for coordinator
 
 func reduceHelper(reducef func(string, []string) string, reduceTaskId int, kva []KeyValue) {
-	oname := fmt.Sprintf("mr-out-%d", reduceTaskId)
-	ofile, _ := os.Create(oname)
+	// oname := fmt.Sprintf("mr-out-%d", reduceTaskId)
+	tempFile, err := os.CreateTemp("", fmt.Sprintf("mr-reduce-%d-*", reduceTaskId))
+	if err != nil {
+		log.Fatalf("cannot create temp file for reduce task %d", reduceTaskId)
+	}
 
 	//
 	// call Reduce on each distinct key in intermediate[],
@@ -57,12 +60,12 @@ func reduceHelper(reducef func(string, []string) string, reduceTaskId int, kva [
 		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+		fmt.Fprintf(tempFile, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
-
-	ofile.Close()
+	os.Rename(tempFile.Name(), fmt.Sprintf("mr-out-%d", reduceTaskId))
+	tempFile.Close()
 }
 
 // main/mrworker.go calls this function.
@@ -80,10 +83,6 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		if !ok {
 			log.Fatalf("call askForTask failed")
 		}
-		// if (reply.taskType == "exit") {
-		// 	fmt.Printf("Worker %d received exit signal\n", os.Getpid())
-		// 	break
-		// }
 
 		taskType := reply.taskType
 		switch taskType {
@@ -110,6 +109,9 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 					encoders[reduceTaskNum].Encode(&kv)
 				}
 				for i := 0; i < reply.nReduce; i++ {
+					// 我之前在担心如果worker超时了，那么这个map task会被多次执行
+					// 那么可能会有多个形如mr-taskId-reduceTaskId的中间文件存在，导致reduce阶段重复计算
+					// 但是rename会覆盖同名文件，所以不需要担心这个问题，在reduce stage的时候只有一个唯一的intermediate文件
 					os.Rename(intermediateFiles[i].Name(), fmt.Sprintf("mr-%d-%d", reply.taskId, i))
 					intermediateFiles[i].Close()
 				}
