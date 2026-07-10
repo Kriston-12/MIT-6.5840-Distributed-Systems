@@ -25,18 +25,18 @@ const (
 )
 
 type Task struct {
-	ID			int
-	File 		string
-	State		TaskState
-	StartTime	time.Time
+	File      string
+	State     TaskState
+	StartTime time.Time
+	Attempt   int
 }
 
 type Coordinator struct {
-	mu 			sync.Mutex
-	phase 		Phase
-	nMap		int
-	nReduce		int
-	mapTasks	[]Task
+	mu          sync.Mutex
+	phase       Phase
+	nMap        int
+	nReduce     int
+	mapTasks    []Task
 	reduceTasks []Task
 }
 
@@ -49,7 +49,6 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
-
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server(sockname string) {
@@ -66,62 +65,68 @@ func (c *Coordinator) server(sockname string) {
 func (c *Coordinator) Assign(args *RPCArgs, reply *RPCReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if (c.phase == Map) {	
+	if c.phase == Map {
 		for i, task := range c.mapTasks {
 			if task.State == Idle {
 				c.mapTasks[i].State = InProgress
 				c.mapTasks[i].StartTime = time.Now()
-				reply.taskType = "map"
-				reply.taskId = task.ID
-				reply.mapFile = task.File
-				reply.nReduce = c.nReduce
+				reply.TaskType = "map"
+				reply.TaskId = i
+				reply.MapFile = task.File
+				reply.NReduce = c.nReduce
+				reply.Attempt = c.mapTasks[i].Attempt
+				log.Printf("ASSIGN type=%s task=%d start=%s attempt=%d", reply.TaskType, reply.TaskId, c.mapTasks[i].StartTime.Format(time.RFC3339Nano), reply.Attempt)
 				return nil
 			}
 		}
 		// If no idle map tasks, let workers wait
-		reply.taskType = "wait"
+		reply.TaskType = "wait"
 		return nil
-	} else if (c.phase == Reduce) {
+	} else if c.phase == Reduce {
 		for i, task := range c.reduceTasks {
 			if task.State == Idle {
 				c.reduceTasks[i].State = InProgress
 				c.reduceTasks[i].StartTime = time.Now()
-				reply.taskType = "reduce"
-				reply.taskId = task.ID
-				reply.nReduce = c.nReduce
+				reply.TaskType = "reduce"
+				reply.TaskId = i
+				reply.NReduce = c.nReduce
+				reply.Attempt = c.reduceTasks[i].Attempt
+				log.Printf("ASSIGN type=%s task=%d start=%s attempt=%d", reply.TaskType, reply.TaskId, c.reduceTasks[i].StartTime.Format(time.RFC3339Nano), reply.Attempt)
 				return nil
 			}
 		}
 		// If no idle reduce tasks, let workers wait
-		reply.taskType = "wait"
+		reply.TaskType = "wait"
 		return nil
 	}
 	// If the phase is AllDone, tell workers to exit
-	reply.taskType = "exit"
+	reply.TaskType = "exit"
 	return nil
 }
 
-func (c *Coordinator) reportTaskCompletion(args *DoneArgs, reply *RPCReply) error {
+func (c *Coordinator) ReportTaskCompletion(args *DoneArgs, reply *RPCReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if (args.taskType == "map") {
-		if time.Since(c.mapTasks[args.TaskId].StartTime) > 10*time.Second {
-			log.Printf("Warning: Map task %d reported completion after timeout", args.TaskId)
-			return nil // Ignore late completion reports
+	if args.TaskType == "map" {
+		task := &c.mapTasks[args.TaskId]
+		if task.Attempt != args.Attempt {
+			log.Printf("REJECT type=%s task=%d attempt=%d expected=%d", args.TaskType, args.TaskId, args.Attempt, task.Attempt)
+			return nil
 		}
-		c.mapTasks[args.TaskId].State = Completed
+		task.State = Completed
 		for _, task := range c.mapTasks {
 			if task.State != Completed {
 				return nil
 			}
 		}
 		c.phase = Reduce
-	} else if (args.taskType == "reduce") {
-		if time.Since(c.reduceTasks[args.TaskId].StartTime) > 10*time.Second {
-			log.Printf("Warning: Reduce task %d reported completion after timeout", args.TaskId)
-			return nil // Ignore late completion reports
+	} else if args.TaskType == "reduce" {
+		task := &c.reduceTasks[args.TaskId]
+		if task.Attempt != args.Attempt {
+			log.Printf("REJECT type=%s task=%d attempt=%d expected=%d", args.TaskType, args.TaskId, args.Attempt, task.Attempt)
+			return nil
 		}
-		c.reduceTasks[args.TaskId].State = Completed
+		task.State = Completed
 		for _, task := range c.reduceTasks {
 			if task.State != Completed {
 				return nil
@@ -136,7 +141,8 @@ func (c *Coordinator) reportTaskCompletion(args *DoneArgs, reply *RPCReply) erro
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
 	ret := false
-
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	// Your code here.
 	if c.phase == AllDone {
 		ret = true
@@ -145,15 +151,72 @@ func (c *Coordinator) Done() bool {
 	return ret
 }
 
+func (c *Coordinator) expireTasksLocked(tasks []Task, taskType string) {
+	for i := range tasks {
+		task := &tasks[i]
+		if task.State == InProgress {
+			elapsed := time.Since(task.StartTime)
+			if elapsed > 10*time.Second {
+				task.State = Idle
+				log.Printf("TIMEOUT type=%s task=%d attempt=%d elapsed=%s", taskType, i, task.Attempt, elapsed)
+				
+				task.Attempt++
+				task.State = Idle
+			}
+		}
+	}
+}
+
+// check if any in-progress tasks have timed out and reset them to idle
+func (c *Coordinator) CheckTimeout() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		c.mu.Lock()
+		if c.phase == Map {
+			c.expireTasksLocked(c.mapTasks, "map")
+		} else if c.phase == Reduce {
+			c.expireTasksLocked(c.reduceTasks, "reduce")
+		} else if c.phase == AllDone {
+			c.mu.Unlock()
+			return
+		}
+		c.mu.Unlock()
+	}
+}
+
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
+	c := Coordinator{
+		phase:       Map,
+		nMap:        len(files),
+		nReduce:     nReduce,
+		mapTasks:    make([]Task, len(files)),
+		reduceTasks: make([]Task, nReduce),
+	}
 
 	// Your code here.
+	// 下面的写法是错的，task.State是在修改副本
+	// _, task := range ...这里task是原切片元素的value copy
+	// for _, task := range c.mapTasks {
+	// 	task.State = Idle
 
+	// }
+
+	for i := 0; i < c.nMap; i++ {
+		c.mapTasks[i].File = files[i]
+		c.mapTasks[i].State = Idle
+	}
+
+	for i := 0; i < c.nReduce; i++ {
+		c.reduceTasks[i].State = Idle
+	}
 
 	c.server(sockname)
+
+	go c.CheckTimeout()
+
 	return &c
 }

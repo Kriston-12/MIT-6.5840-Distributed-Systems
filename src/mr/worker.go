@@ -1,14 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-import "path/filepath"
-import "encoding/json"
-import "sort"
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -35,7 +37,7 @@ var coordSockName string // socket for coordinator
 
 func reduceHelper(reducef func(string, []string) string, reduceTaskId int, kva []KeyValue) {
 	// oname := fmt.Sprintf("mr-out-%d", reduceTaskId)
-	tempFile, err := os.CreateTemp("", fmt.Sprintf("mr-reduce-%d-*", reduceTaskId))
+	tempFile, err := os.CreateTemp(".", fmt.Sprintf("mr-reduce-%d-*", reduceTaskId))
 	if err != nil {
 		log.Fatalf("cannot create temp file for reduce task %d", reduceTaskId)
 	}
@@ -64,8 +66,12 @@ func reduceHelper(reducef func(string, []string) string, reduceTaskId int, kva [
 
 		i = j
 	}
-	os.Rename(tempFile.Name(), fmt.Sprintf("mr-out-%d", reduceTaskId))
-	tempFile.Close()
+	if err := tempFile.Close(); err != nil {
+		log.Fatalf("cannot close reduce task %d output: %v", reduceTaskId, err)
+	}
+	if err := os.Rename(tempFile.Name(), fmt.Sprintf("mr-out-%d", reduceTaskId)); err != nil {
+		log.Fatalf("cannot publish reduce task %d output: %v", reduceTaskId, err)
+	}
 }
 
 // main/mrworker.go calls this function.
@@ -79,93 +85,110 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reply := RPCReply{}
 
 	for {
+		reply = RPCReply{}
 		ok := call("Coordinator.Assign", &args, &reply)
 		if !ok {
 			log.Fatalf("call Coordinator.Assign failed")
-			return 
+			return
 		}
 
-		taskType := reply.taskType
+		taskType := reply.TaskType
+		if taskType == "map" || taskType == "reduce" {
+			log.Printf("RECV worker=%d type=%s task=%d nReduce=%d", os.Getpid(), taskType, reply.TaskId, reply.NReduce)
+		}
 		switch taskType {
-			case "map":
-				fmt.Printf("Worker %d received a map task with id %d and file %v\n", os.Getpid(), reply.taskId, reply.mapFile)
-				kva := []KeyValue{}
-				inputFile := reply.mapFile
-				contentBytes, err := os.ReadFile(inputFile)
-				if err != nil {
-					log.Fatalf("cannot read %v", inputFile)
-					return
-				}
-				content := string(contentBytes)
-				kva = mapf(inputFile, content)
-				// Create intermediate files for each reduce task
-				intermediateFiles := make([]*os.File, reply.nReduce)
-				encoders := make([]*json.Encoder, reply.nReduce)
-				for i := 0; i < reply.nReduce; i++ {
-					intermediateFiles[i], _ = os.CreateTemp("",fmt.Sprintf("mr-map-%d-*", i))
-					encoders[i] = json.NewEncoder(intermediateFiles[i])
-				}
-				for _, kv := range kva {
-					reduceTaskNum := ihash(kv.Key) % reply.nReduce
-					encoders[reduceTaskNum].Encode(&kv)
-				}
-				for i := 0; i < reply.nReduce; i++ {
-					// 我之前在担心如果worker超时了，那么这个map task会被多次执行
-					// 那么可能会有多个形如mr-taskId-reduceTaskId的中间文件存在，导致reduce阶段重复计算
-					// 但是rename会覆盖同名文件，所以不需要担心这个问题，在reduce stage的时候只有一个唯一的intermediate文件
-					os.Rename(intermediateFiles[i].Name(), fmt.Sprintf("mr-%d-%d", reply.taskId, i))
-					intermediateFiles[i].Close()
-				}
-				ok := call("Coordinator.reportTaskCompletion", &DoneArgs{taskType: "map", TaskId: reply.taskId}, &RPCReply{})
-				if !ok {
-					log.Fatalf("call reportTaskCompletion failed")
-					return 
-				}
-				
-			case "reduce":
-				// fmt.Printf("Worker %d received a reduce task with id %d and files %v\n", os.Getpid(), reply.taskId, reply.files)
-				// reply.taskId is the unique identifier of intermediate files. Any intermediate file alike pattern "mr-*-reply.taskId" will be used for reduce task.
-				pattern := fmt.Sprintf("mr-*-%d", reply.taskId)
-				intermediateFiles, err := filepath.Glob(pattern)
-				if err != nil {
-					log.Fatalf("cannot find intermediate files for pattern %v", pattern)
-					return
-				}
-				kva := []KeyValue{}
-				for _, intermediateFile := range intermediateFiles {
-					file, err := os.Open(intermediateFile)
-					if err != nil {
-						log.Fatalf("cannot open %v", intermediateFile)
-					}
-					dec := json.NewDecoder(file)
-					for {
-						var kv KeyValue
-						if err := dec.Decode(&kv); err != nil {
-							break
-						}
-						kva = append(kva, kv)
-					}
-					file.Close()	
-				}
-				sort.Sort(ByKey(kva))
-				reduceHelper(reducef, reply.taskId, kva)
-				ok := call("Coordinator.reportTaskCompletion", &DoneArgs{taskType: "reduce", TaskId: reply.taskId}, &RPCReply{})
-				if !ok {
-					log.Fatalf("call reportTaskCompletion failed")
-					return 
-				}
-			case "wait":
-				// fmt.Printf("Worker %d received a wait signal\n", os.Getpid())
-				// Wait for a while before asking for a new task
-				time.Sleep(1 * time.Second)
-			case "exit":
-				fmt.Printf("Worker %d received exit signal\n", os.Getpid())
+		case "map":
+			kva := []KeyValue{}
+			inputFile := reply.MapFile
+			contentBytes, err := os.ReadFile(inputFile)
+			if err != nil {
+				log.Fatalf("cannot read %v", inputFile)
 				return
-			default:
-				log.Fatalf("Unknown task type: %v", taskType)
+			}
+			content := string(contentBytes)
+			mapStarted := time.Now()
+			kva = mapf(inputFile, content)
+			mapElapsed := time.Since(mapStarted)
+			log.Printf("MAPF function elapsed=%s", mapElapsed)
+			// Create intermediate files for each reduce task
+			fileWriteStarted := time.Now()
+			intermediateFiles := make([]*os.File, reply.NReduce)
+			encoders := make([]*json.Encoder, reply.NReduce)
+			for i := 0; i < reply.NReduce; i++ {
+				intermediateFiles[i], err = os.CreateTemp(".", fmt.Sprintf("mr-map-%d-*", i))
+				if err != nil {
+					log.Fatalf("cannot create intermediate file for map task %d: %v", reply.TaskId, err)
+				}
+				encoders[i] = json.NewEncoder(intermediateFiles[i])
+			}
+			for _, kv := range kva {
+				reduceTaskNum := ihash(kv.Key) % reply.NReduce
+				encoders[reduceTaskNum].Encode(&kv)
+			}
+			for i := 0; i < reply.NReduce; i++ {
+				// 我之前在担心如果worker超时了，那么这个map task会被多次执行
+				// 那么可能会有多个形如mr-taskId-reduceTaskId的中间文件存在，导致reduce阶段重复计算
+				// 但是rename会覆盖同名文件，所以不需要担心这个问题，在reduce stage的时候只有一个唯一的intermediate文件
+				if err := intermediateFiles[i].Close(); err != nil {
+					log.Fatalf("cannot close intermediate file for map task %d: %v", reply.TaskId, err)
+				}
+				if err := os.Rename(intermediateFiles[i].Name(), fmt.Sprintf("mr-%d-%d", reply.TaskId, i)); err != nil {
+					log.Fatalf("cannot publish intermediate file for map task %d: %v", reply.TaskId, err)
+				}
+			}
+			fileWriteElapsed := time.Since(fileWriteStarted)
+			log.Printf("MAPF file write elapsed=%s", fileWriteElapsed)
+			log.Printf("SEND worker=%d type=map task=%d", os.Getpid(), reply.TaskId)
+			ok := call("Coordinator.ReportTaskCompletion", &DoneArgs{TaskType: "map", TaskId: reply.TaskId, Attempt: reply.Attempt}, &RPCReply{})
+			if !ok {
+				log.Fatalf("call ReportTaskCompletion failed")
+				return
+			}
+			
+
+		case "reduce":
+			// fmt.Printf("Worker %d received a reduce task with id %d and files %v\n", os.Getpid(), reply.taskId, reply.files)
+			// reply.taskId is the unique identifier of intermediate files. Any intermediate file alike pattern "mr-*-reply.taskId" will be used for reduce task.
+			pattern := fmt.Sprintf("mr-*-%d", reply.TaskId)
+			intermediateFiles, err := filepath.Glob(pattern)
+			if err != nil {
+				log.Fatalf("cannot find intermediate files for pattern %v", pattern)
+				return
+			}
+			kva := []KeyValue{}
+			for _, intermediateFile := range intermediateFiles {
+				file, err := os.Open(intermediateFile)
+				if err != nil {
+					log.Fatalf("cannot open %v", intermediateFile)
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					kva = append(kva, kv)
+				}
+				file.Close()
+			}
+			sort.Sort(ByKey(kva))
+			reduceHelper(reducef, reply.TaskId, kva)
+			log.Printf("SEND worker=%d type=reduce task=%d", os.Getpid(), reply.TaskId)
+			ok := call("Coordinator.ReportTaskCompletion", &DoneArgs{TaskType: "reduce", TaskId: reply.TaskId, Attempt: reply.Attempt}, &RPCReply{})
+			if !ok {
+				log.Fatalf("call ReportTaskCompletion failed")
+				return
+			}
+		case "wait":
+			time.Sleep(1 * time.Second)
+		case "exit":
+			log.Printf("EXIT worker=%d", os.Getpid())
+			return
+		default:
+			log.Fatalf("Unknown task type: %v", taskType)
 		}
 	}
-	
+
 }
 
 // example function to show how to make an RPC call to the coordinator.
@@ -206,9 +229,11 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	}
 	defer c.Close()
 
-	if err := c.Call(rpcname, args, reply); err == nil {
+	err = c.Call(rpcname, args, reply)
+	if err == nil {
 		return true
 	}
-	log.Printf("%d: call failed err %v", os.Getpid(), err)
+	log.Printf("%d: call %q failed: %v", os.Getpid(), rpcname, err)
+
 	return false
 }
