@@ -79,21 +79,22 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reply := RPCReply{}
 
 	for {
-		ok := call("Worker.askForTask", &args, &reply)
+		ok := call("Coordinator.Assign", &args, &reply)
 		if !ok {
-			log.Fatalf("call askForTask failed")
+			log.Fatalf("call Coordinator.Assign failed")
+			return 
 		}
 
 		taskType := reply.taskType
 		switch taskType {
 			case "map":
-				fmt.Printf("Worker %d received a map task with id %d and files %v\n", os.Getpid(), reply.taskId, reply.files)
+				fmt.Printf("Worker %d received a map task with id %d and file %v\n", os.Getpid(), reply.taskId, reply.mapFile)
 				kva := []KeyValue{}
-				// For each worker of map task, it will receive only one input file
-				inputFile := reply.files[0]
+				inputFile := reply.mapFile
 				contentBytes, err := os.ReadFile(inputFile)
 				if err != nil {
 					log.Fatalf("cannot read %v", inputFile)
+					return
 				}
 				content := string(contentBytes)
 				kva = mapf(inputFile, content)
@@ -115,9 +116,10 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 					os.Rename(intermediateFiles[i].Name(), fmt.Sprintf("mr-%d-%d", reply.taskId, i))
 					intermediateFiles[i].Close()
 				}
-				ok := call("Worker.reportTaskCompletion", &MapDoneArgs{taskType: "map", TaskId: reply.taskId}, &RPCReply{})
+				ok := call("Coordinator.reportTaskCompletion", &DoneArgs{taskType: "map", TaskId: reply.taskId}, &RPCReply{})
 				if !ok {
 					log.Fatalf("call reportTaskCompletion failed")
+					return 
 				}
 				
 			case "reduce":
@@ -127,6 +129,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 				intermediateFiles, err := filepath.Glob(pattern)
 				if err != nil {
 					log.Fatalf("cannot find intermediate files for pattern %v", pattern)
+					return
 				}
 				kva := []KeyValue{}
 				for _, intermediateFile := range intermediateFiles {
@@ -146,9 +149,10 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 				}
 				sort.Sort(ByKey(kva))
 				reduceHelper(reducef, reply.taskId, kva)
-				ok := call("Worker.reportTaskCompletion", &MapDoneArgs{taskType: "reduce", TaskId: reply.taskId}, &RPCReply{})
+				ok := call("Coordinator.reportTaskCompletion", &DoneArgs{taskType: "reduce", TaskId: reply.taskId}, &RPCReply{})
 				if !ok {
 					log.Fatalf("call reportTaskCompletion failed")
+					return 
 				}
 			case "wait":
 				// fmt.Printf("Worker %d received a wait signal\n", os.Getpid())
