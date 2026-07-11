@@ -75,7 +75,7 @@ func (c *Coordinator) Assign(args *RPCArgs, reply *RPCReply) error {
 				reply.MapFile = task.File
 				reply.NReduce = c.nReduce
 				reply.Attempt = c.mapTasks[i].Attempt
-				log.Printf("ASSIGN type=%s task=%d start=%s attempt=%d", reply.TaskType, reply.TaskId, c.mapTasks[i].StartTime.Format(time.RFC3339Nano), reply.Attempt)
+				debugf("ASSIGN type=%s task=%d start=%s attempt=%d", reply.TaskType, reply.TaskId, c.mapTasks[i].StartTime.Format(time.RFC3339Nano), reply.Attempt)
 				return nil
 			}
 		}
@@ -91,7 +91,7 @@ func (c *Coordinator) Assign(args *RPCArgs, reply *RPCReply) error {
 				reply.TaskId = i
 				reply.NReduce = c.nReduce
 				reply.Attempt = c.reduceTasks[i].Attempt
-				log.Printf("ASSIGN type=%s task=%d start=%s attempt=%d", reply.TaskType, reply.TaskId, c.reduceTasks[i].StartTime.Format(time.RFC3339Nano), reply.Attempt)
+				debugf("ASSIGN type=%s task=%d start=%s attempt=%d", reply.TaskType, reply.TaskId, c.reduceTasks[i].StartTime.Format(time.RFC3339Nano), reply.Attempt)
 				return nil
 			}
 		}
@@ -110,7 +110,7 @@ func (c *Coordinator) ReportTaskCompletion(args *DoneArgs, reply *RPCReply) erro
 	if args.TaskType == "map" {
 		task := &c.mapTasks[args.TaskId]
 		if task.Attempt != args.Attempt {
-			log.Printf("REJECT type=%s task=%d attempt=%d expected=%d", args.TaskType, args.TaskId, args.Attempt, task.Attempt)
+			debugf("REJECT type=%s task=%d attempt=%d expected=%d", args.TaskType, args.TaskId, args.Attempt, task.Attempt)
 			return nil
 		}
 		task.State = Completed
@@ -123,7 +123,7 @@ func (c *Coordinator) ReportTaskCompletion(args *DoneArgs, reply *RPCReply) erro
 	} else if args.TaskType == "reduce" {
 		task := &c.reduceTasks[args.TaskId]
 		if task.Attempt != args.Attempt {
-			log.Printf("REJECT type=%s task=%d attempt=%d expected=%d", args.TaskType, args.TaskId, args.Attempt, task.Attempt)
+			debugf("REJECT type=%s task=%d attempt=%d expected=%d", args.TaskType, args.TaskId, args.Attempt, task.Attempt)
 			return nil
 		}
 		task.State = Completed
@@ -158,8 +158,8 @@ func (c *Coordinator) expireTasksLocked(tasks []Task, taskType string) {
 			elapsed := time.Since(task.StartTime)
 			if elapsed > 10*time.Second {
 				task.State = Idle
-				log.Printf("TIMEOUT type=%s task=%d attempt=%d elapsed=%s", taskType, i, task.Attempt, elapsed)
-				
+				debugf("TIMEOUT type=%s task=%d attempt=%d elapsed=%s", taskType, i, task.Attempt, elapsed)
+
 				task.Attempt++
 				task.State = Idle
 			}

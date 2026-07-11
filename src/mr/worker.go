@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -33,7 +34,16 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-var coordSockName string // socket for coordinator
+var (
+	coordSockName = "" // socket for coordinator
+	debugLogging  = false
+)
+
+func debugf(format string, args ...interface{}) {
+	if debugLogging {
+		log.Printf(format, args...)
+	}
+}
 
 func reduceHelper(reducef func(string, []string) string, reduceTaskId int, kva []KeyValue) {
 	// oname := fmt.Sprintf("mr-out-%d", reduceTaskId)
@@ -41,6 +51,7 @@ func reduceHelper(reducef func(string, []string) string, reduceTaskId int, kva [
 	if err != nil {
 		log.Fatalf("cannot create temp file for reduce task %d", reduceTaskId)
 	}
+	writer := bufio.NewWriter(tempFile)
 
 	//
 	// call Reduce on each distinct key in intermediate[],
@@ -62,9 +73,14 @@ func reduceHelper(reducef func(string, []string) string, reduceTaskId int, kva [
 		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(tempFile, "%v %v\n", kva[i].Key, output)
+		if _, err := fmt.Fprintf(writer, "%v %v\n", kva[i].Key, output); err != nil {
+			log.Fatalf("cannot write reduce task %d output: %v", reduceTaskId, err)
+		}
 
 		i = j
+	}
+	if err := writer.Flush(); err != nil {
+		log.Fatalf("cannot flush reduce task %d output: %v", reduceTaskId, err)
 	}
 	if err := tempFile.Close(); err != nil {
 		log.Fatalf("cannot close reduce task %d output: %v", reduceTaskId, err)
@@ -94,7 +110,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 		taskType := reply.TaskType
 		if taskType == "map" || taskType == "reduce" {
-			log.Printf("RECV worker=%d type=%s task=%d nReduce=%d", os.Getpid(), taskType, reply.TaskId, reply.NReduce)
+			debugf("RECV worker=%d type=%s task=%d nReduce=%d", os.Getpid(), taskType, reply.TaskId, reply.NReduce)
 		}
 		switch taskType {
 		case "map":
@@ -109,17 +125,19 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			mapStarted := time.Now()
 			kva = mapf(inputFile, content)
 			mapElapsed := time.Since(mapStarted)
-			log.Printf("MAPF function elapsed=%s", mapElapsed)
+			debugf("MAPF function elapsed=%s", mapElapsed)
 			// Create intermediate files for each reduce task
 			fileWriteStarted := time.Now()
 			intermediateFiles := make([]*os.File, reply.NReduce)
+			writers := make([]*bufio.Writer, reply.NReduce)
 			encoders := make([]*json.Encoder, reply.NReduce)
 			for i := 0; i < reply.NReduce; i++ {
 				intermediateFiles[i], err = os.CreateTemp(".", fmt.Sprintf("mr-map-%d-*", i))
 				if err != nil {
 					log.Fatalf("cannot create intermediate file for map task %d: %v", reply.TaskId, err)
 				}
-				encoders[i] = json.NewEncoder(intermediateFiles[i])
+				writers[i] = bufio.NewWriter(intermediateFiles[i])
+				encoders[i] = json.NewEncoder(writers[i])
 			}
 			for _, kv := range kva {
 				reduceTaskNum := ihash(kv.Key) % reply.NReduce
@@ -129,6 +147,9 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 				// 我之前在担心如果worker超时了，那么这个map task会被多次执行
 				// 那么可能会有多个形如mr-taskId-reduceTaskId的中间文件存在，导致reduce阶段重复计算
 				// 但是rename会覆盖同名文件，所以不需要担心这个问题，在reduce stage的时候只有一个唯一的intermediate文件
+				if err := writers[i].Flush(); err != nil {
+					log.Fatalf("cannot flush intermediate file for map task %d: %v", reply.TaskId, err)
+				}
 				if err := intermediateFiles[i].Close(); err != nil {
 					log.Fatalf("cannot close intermediate file for map task %d: %v", reply.TaskId, err)
 				}
@@ -137,14 +158,13 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 				}
 			}
 			fileWriteElapsed := time.Since(fileWriteStarted)
-			log.Printf("MAPF file write elapsed=%s", fileWriteElapsed)
-			log.Printf("SEND worker=%d type=map task=%d", os.Getpid(), reply.TaskId)
+			debugf("MAPF file write elapsed=%s", fileWriteElapsed)
+			debugf("SEND worker=%d type=map task=%d", os.Getpid(), reply.TaskId)
 			ok := call("Coordinator.ReportTaskCompletion", &DoneArgs{TaskType: "map", TaskId: reply.TaskId, Attempt: reply.Attempt}, &RPCReply{})
 			if !ok {
 				log.Fatalf("call ReportTaskCompletion failed")
 				return
 			}
-			
 
 		case "reduce":
 			// fmt.Printf("Worker %d received a reduce task with id %d and files %v\n", os.Getpid(), reply.taskId, reply.files)
@@ -173,7 +193,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			}
 			sort.Sort(ByKey(kva))
 			reduceHelper(reducef, reply.TaskId, kva)
-			log.Printf("SEND worker=%d type=reduce task=%d", os.Getpid(), reply.TaskId)
+			debugf("SEND worker=%d type=reduce task=%d", os.Getpid(), reply.TaskId)
 			ok := call("Coordinator.ReportTaskCompletion", &DoneArgs{TaskType: "reduce", TaskId: reply.TaskId, Attempt: reply.Attempt}, &RPCReply{})
 			if !ok {
 				log.Fatalf("call ReportTaskCompletion failed")
@@ -182,7 +202,7 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		case "wait":
 			time.Sleep(1 * time.Second)
 		case "exit":
-			log.Printf("EXIT worker=%d", os.Getpid())
+			debugf("EXIT worker=%d", os.Getpid())
 			return
 		default:
 			log.Fatalf("Unknown task type: %v", taskType)
