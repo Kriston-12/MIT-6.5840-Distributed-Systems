@@ -73,6 +73,6 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 		if reply.Err == rpc.ErrVersion && retried {
 			return rpc.ErrMaybe
 		}
-		return reply.Err
+		return reply.Err // rpc.OK, rpc.ErrVersion, rpc.ErrNoKey
 	}
 }

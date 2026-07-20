@@ -1,0 +1,561 @@
+<title>分布式锁 · 一间会议室的故事</title>
+<style>
+  :root{
+    --bg:#E6EAF0; --surface:#FBFCFD; --surface-2:#F1F4F8;
+    --ink:#161A21; --ink-soft:#57617340; --muted:#5B6473; --line:#CCD4DF;
+    --accent:#2C4A8A;
+    --free:#1F8A5B; --held:#B9791A; --wait:#6B7688; --err:#BF4331; --safe:#1F8A5B;
+    --cA:#3F6FD1; --cB:#B4508F; --cC:#1F9E8D;
+    --shadow:0 1px 2px rgba(20,30,50,.06),0 8px 24px rgba(20,30,50,.06);
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0E1218; --surface:#161B23; --surface-2:#1B212B;
+      --ink:#E7ECF3; --muted:#98A2B2; --line:#2A313C;
+      --accent:#84A3E6;
+      --free:#43C08A; --held:#E3A84E; --wait:#8A94A5; --err:#E27A64; --safe:#43C08A;
+      --cA:#5E8AEE; --cB:#D170B0; --cC:#3DBBAA;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#E6EAF0; --surface:#FBFCFD; --surface-2:#F1F4F8;
+    --ink:#161A21; --muted:#5B6473; --line:#CCD4DF; --accent:#2C4A8A;
+    --free:#1F8A5B; --held:#B9791A; --wait:#6B7688; --err:#BF4331; --safe:#1F8A5B;
+    --cA:#3F6FD1; --cB:#B4508F; --cC:#1F9E8D;
+    --shadow:0 1px 2px rgba(20,30,50,.06),0 8px 24px rgba(20,30,50,.06);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0E1218; --surface:#161B23; --surface-2:#1B212B;
+    --ink:#E7ECF3; --muted:#98A2B2; --line:#2A313C; --accent:#84A3E6;
+    --free:#43C08A; --held:#E3A84E; --wait:#8A94A5; --err:#E27A64; --safe:#43C08A;
+    --cA:#5E8AEE; --cB:#D170B0; --cC:#3DBBAA;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0}
+  .page{
+    background:var(--bg); color:var(--ink); font-family:var(--sans);
+    line-height:1.6; -webkit-font-smoothing:antialiased;
+    padding:clamp(20px,5vw,64px) 20px 80px;
+  }
+  .wrap{max-width:1000px; margin:0 auto}
+  .eyebrow{
+    font-family:var(--mono); font-size:12px; letter-spacing:.22em; text-transform:uppercase;
+    color:var(--accent); margin:0 0 14px; font-weight:600;
+  }
+  h1{
+    font-family:var(--mono); font-weight:700; letter-spacing:-.01em;
+    font-size:clamp(28px,5.5vw,46px); line-height:1.08; margin:0 0 18px; text-wrap:balance;
+  }
+  h2{
+    font-size:clamp(20px,3.2vw,27px); font-weight:700; letter-spacing:-.01em;
+    margin:0 0 6px; text-wrap:balance;
+  }
+  .lede{font-size:clamp(16px,2vw,19px); color:var(--muted); max-width:64ch; margin:0}
+  section{margin-top:clamp(44px,7vw,72px)}
+  .sec-head{display:flex; align-items:baseline; gap:14px; margin-bottom:22px}
+  .sec-num{font-family:var(--mono); font-size:13px; color:var(--muted); padding-top:4px}
+  p{margin:0 0 14px; max-width:66ch}
+  code{font-family:var(--mono); font-size:.9em; background:var(--surface-2);
+    border:1px solid var(--line); border-radius:5px; padding:.08em .38em; white-space:nowrap}
+  .accent{color:var(--accent)}
+  b{font-weight:650}
+
+  /* ---- cast stat tiles ---- */
+  .tiles{display:grid; grid-template-columns:repeat(4,1fr); gap:14px}
+  .tile{background:var(--surface); border:1px solid var(--line); border-radius:14px;
+    padding:18px 18px 16px; box-shadow:var(--shadow)}
+  .tile .big{font-family:var(--mono); font-size:clamp(22px,3.4vw,30px); font-weight:700; line-height:1;
+    letter-spacing:-.01em; font-variant-numeric:tabular-nums}
+  .tile .k{font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--accent); margin:10px 0 6px; font-weight:600}
+  .tile .d{font-size:13.5px; color:var(--muted); line-height:1.45}
+
+  /* ---- mapping table ---- */
+  .map{background:var(--surface); border:1px solid var(--line); border-radius:14px;
+    box-shadow:var(--shadow); overflow:hidden; margin-top:22px}
+  .map .row{display:grid; grid-template-columns:1fr 1.15fr; gap:0; border-top:1px solid var(--line)}
+  .map .row:first-child{border-top:0}
+  .map .cell{padding:12px 16px; font-size:14.5px}
+  .map .cell:first-child{border-right:1px solid var(--line); font-family:var(--mono); font-size:13px}
+  .map .head .cell{background:var(--surface-2); font-family:var(--mono); font-size:11px;
+    letter-spacing:.14em; text-transform:uppercase; color:var(--accent); font-weight:600}
+
+  /* ---- simulation ---- */
+  .sim{background:var(--surface); border:1px solid var(--line); border-radius:18px;
+    box-shadow:var(--shadow); padding:clamp(16px,2.6vw,26px); margin-top:8px}
+  .server{border:1px solid var(--line); border-radius:14px; background:var(--surface-2);
+    padding:16px 18px; position:relative; transition:box-shadow .25s,border-color .25s}
+  .server.hit{border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
+  .srv-top{display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px}
+  .srv-title{font-family:var(--mono); font-size:12px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--muted); font-weight:600}
+  .mu-badge{font-family:var(--mono); font-size:11px; color:var(--muted); border:1px dashed var(--line);
+    border-radius:999px; padding:4px 10px; white-space:nowrap}
+  .ledger{display:grid; grid-template-columns:auto 1fr auto; gap:10px 18px; align-items:center;
+    margin-top:14px; padding:14px; background:var(--surface); border:1px solid var(--line); border-radius:11px}
+  .lb{font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted)}
+  .lv{font-family:var(--mono); font-weight:700; font-size:17px; font-variant-numeric:tabular-nums}
+  .ledger .full{grid-column:1/-1; display:flex; align-items:center; gap:12px; flex-wrap:wrap}
+  .chip{display:inline-flex; align-items:center; gap:7px; font-family:var(--mono); font-weight:600;
+    font-size:14px; padding:5px 12px; border-radius:999px; border:1px solid var(--line); background:var(--surface-2)}
+  .dot{width:10px; height:10px; border-radius:50%; flex:none}
+  .status{font-family:var(--mono); font-size:13px; font-weight:700; padding:4px 12px; border-radius:999px}
+  .status.s-none{color:var(--muted); background:color-mix(in srgb,var(--muted) 14%,transparent)}
+  .status.s-free{color:var(--free); background:color-mix(in srgb,var(--free) 15%,transparent)}
+  .status.s-held{color:var(--held); background:color-mix(in srgb,var(--held) 16%,transparent)}
+
+  .room-row{display:grid; grid-template-columns:1.3fr 1fr; gap:14px; margin-top:14px}
+  .room,.safe{border:1px solid var(--line); border-radius:12px; padding:14px 16px; background:var(--surface-2)}
+  .room{transition:background .35s,border-color .35s}
+  .room .lb{margin-bottom:8px}
+  .room .occ{display:flex; align-items:center; gap:10px; font-family:var(--mono); font-weight:700; font-size:15px}
+  .safe{display:flex; flex-direction:column; justify-content:center; gap:6px}
+  .safe .badge{display:inline-flex; align-items:center; gap:8px; font-family:var(--mono); font-weight:700;
+    font-size:14px; color:var(--safe)}
+  .safe .sub{font-size:12.5px; color:var(--muted)}
+
+  .clients{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:14px}
+  .client{border:1px solid var(--line); border-radius:12px; padding:14px; background:var(--surface);
+    border-top:3px solid var(--cc); transition:box-shadow .25s, transform .25s}
+  .client.act{box-shadow:0 0 0 3px color-mix(in srgb,var(--cc) 26%,transparent)}
+  .client .name{display:flex; align-items:center; gap:8px; font-family:var(--mono); font-weight:700; font-size:14px}
+  .client .name .dot{background:var(--cc)}
+  .pill{display:inline-block; font-family:var(--mono); font-size:12px; font-weight:700; padding:4px 10px;
+    border-radius:999px; margin:10px 0 8px}
+  .pill.st-think{color:var(--muted); background:color-mix(in srgb,var(--muted) 14%,transparent)}
+  .pill.st-acq{color:var(--held); background:color-mix(in srgb,var(--held) 16%,transparent)}
+  .pill.st-hold{color:var(--free); background:color-mix(in srgb,var(--free) 15%,transparent)}
+  .client .note{font-size:12.8px; color:var(--muted); line-height:1.45; min-height:2.6em}
+
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  .pill.st-acq{animation:pulse 1.1s ease-in-out infinite}
+
+  .controls{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:18px}
+  button{font-family:var(--mono); font-size:13px; font-weight:600; cursor:pointer;
+    border:1px solid var(--line); background:var(--surface-2); color:var(--ink);
+    padding:9px 16px; border-radius:9px; transition:background .15s,border-color .15s}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent); color:#fff; border-color:var(--accent)}
+  button:disabled{opacity:.4; cursor:not-allowed}
+  button:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+  .speed{display:flex; align-items:center; gap:8px; font-family:var(--mono); font-size:12px; color:var(--muted)}
+  input[type=range]{accent-color:var(--accent)}
+  .prog{margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums}
+
+  .logwrap{margin-top:16px}
+  .log{list-style:none; margin:0; padding:0; max-height:230px; overflow-y:auto;
+    border:1px solid var(--line); border-radius:11px; background:var(--surface-2)}
+  .log li{display:grid; grid-template-columns:26px 1fr; gap:10px; padding:9px 14px; font-size:13.5px;
+    border-top:1px solid var(--line); font-family:var(--mono); line-height:1.4}
+  .log li:first-child{border-top:0}
+  .log .who{font-weight:700}
+  .log .ok .txt{color:var(--free)} .log .err .txt{color:var(--err)}
+  .log .wait .txt{color:var(--wait)} .log .info .txt{color:var(--ink)}
+  .log .txt{font-family:var(--sans)}
+  .log .empty{grid-column:1/-1; color:var(--muted); font-family:var(--sans); text-align:center; padding:22px}
+
+  /* ---- state machine ---- */
+  .smwrap{background:var(--surface); border:1px solid var(--line); border-radius:16px;
+    box-shadow:var(--shadow); padding:clamp(14px,2.4vw,26px); overflow-x:auto}
+  .smwrap svg{display:block; width:100%; min-width:560px; height:auto}
+  .sm-box{fill:var(--surface-2); stroke:var(--line)}
+  .sm-box.free{stroke:var(--free)} .sm-box.held{stroke:var(--held)} .sm-box.none{stroke:var(--muted)}
+  .sm-t{fill:var(--ink); font-family:var(--mono); font-weight:700; font-size:15px}
+  .sm-s{fill:var(--muted); font-family:var(--mono); font-size:11.5px}
+  .sm-edge{stroke:var(--muted); fill:none; stroke-width:1.6}
+  .sm-edge.ok{stroke:var(--free)} .sm-edge.err{stroke:var(--err)}
+  .sm-lab{font-family:var(--sans); font-size:12.5px}
+  .sm-lab.ok{fill:var(--free)} .sm-lab.err{fill:var(--err)} .sm-lab.n{fill:var(--muted)}
+
+  /* ---- compare ---- */
+  .cmp{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:6px}
+  .cmp .card{background:var(--surface); border:1px solid var(--line); border-radius:14px;
+    padding:18px 20px; box-shadow:var(--shadow)}
+  .cmp .card.a{border-top:3px solid var(--wait)}
+  .cmp .card.b{border-top:3px solid var(--accent)}
+  .cmp h3{margin:0 0 4px; font-size:16px; font-family:var(--mono)}
+  .cmp .tag{font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted)}
+  .cmp dl{margin:14px 0 0; display:grid; grid-template-columns:auto 1fr; gap:9px 14px}
+  .cmp dt{font-family:var(--mono); font-size:11.5px; color:var(--muted); letter-spacing:.04em}
+  .cmp dd{margin:0; font-size:14px}
+  .keyline{margin-top:20px; padding:18px 20px; border-left:3px solid var(--accent);
+    background:var(--surface-2); border-radius:0 12px 12px 0; font-size:15px}
+
+  .foot{margin-top:56px; padding-top:22px; border-top:1px solid var(--line); color:var(--muted); font-size:13px}
+  .foot code{font-size:12px}
+
+  @media (max-width:720px){
+    .tiles{grid-template-columns:repeat(2,1fr)}
+    .clients{grid-template-columns:1fr}
+    .room-row{grid-template-columns:1fr}
+    .cmp{grid-template-columns:1fr}
+    .map .row{grid-template-columns:1fr}
+    .map .cell:first-child{border-right:0; border-bottom:1px solid var(--line)}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none !important; transition:none !important}
+  }
+</style>
+
+<div class="page">
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">MIT 6.5840 · kvsrv1/lock · 分布式锁</p>
+    <h1>一间会议室，<br>和一本前台台账</h1>
+    <p class="lede">你懂 <code>sync.Mutex</code>——同一进程里靠共享内存互斥。可这里的"线程"是<b>不同机器上的进程</b>，没有共享内存。它们只能对着<b>同一个 key/value 服务器</b>读写来协调。这一页把那本"台账"的把戏演给你看。</p>
+  </header>
+
+  <!-- ============ CAST ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">01</span><div>
+      <h2>登场角色 · 各有几个？</h2>
+      <p style="margin:0;color:var(--muted)">先把 lab 里的数量关系理清楚。</p>
+    </div></div>
+
+    <div class="tiles">
+      <div class="tile"><div class="big">1</div><div class="k">KV Server</div>
+        <div class="d">全场唯一。就是那张<b>前台台账</b>，所有人都对它读写。（本 lab 单机，多副本是后面 kvraft 的事。）</div></div>
+      <div class="tile"><div class="big">1–10</div><div class="k">Clients</div>
+        <div class="d">测试里 1 个或 10 个（<code>NCLNT</code>）。多个 client <b>同时抢同一把锁</b>——冲突就从这儿来。</div></div>
+      <div class="tile"><div class="big">1 : 1</div><div class="k">Clerk</div>
+        <div class="d">每个 client 一个 clerk，是它<b>打电话给前台的专线</b>（RPC 代理，负责重试）。一个 clerk 可同时服务多把锁。</div></div>
+      <div class="tile"><div class="big">N</div><div class="k">Locks</div>
+        <div class="d">按 <code>lockname</code> 区分，名字不同就是<b>不同的锁</b>，各占台账上一行（一个 key）。测试里最多 2 把。</div></div>
+    </div>
+
+    <div class="map" aria-label="技术概念与会议室场景的对应">
+      <div class="row head"><div class="cell">lab 里的东西</div><div class="cell">会议室场景里对应什么</div></div>
+      <div class="row"><div class="cell">KVServer</div><div class="cell">前台 + 那本<b>台账</b>（大家都来这查、这改）</div></div>
+      <div class="row"><div class="cell">key = lockname</div><div class="cell">台账上"这间会议室"的<b>那一行</b></div></div>
+      <div class="row"><div class="cell">value</div><div class="cell">这行写着<b>谁的名字</b>（空 = 没人订）</div></div>
+      <div class="row"><div class="cell">version（Tversion）</div><div class="cell">这行的<b>修订号</b>，每改一次 +1 —— 防撞车的关键</div></div>
+      <div class="row"><div class="cell">Put(key,val,version)</div><div class="cell">"把名字改掉，<b>但只有台账还停在我看到的那个修订号时才算数</b>"（条件写 / CAS）</div></div>
+      <div class="row"><div class="cell">Clerk.Get / Put</div><div class="cell">打电话给前台<b>查一行 / 改一行</b></div></div>
+      <div class="row"><div class="cell">Acquire()</div><div class="cell">反复打电话，直到成功把名字写上</div></div>
+      <div class="row"><div class="cell">Release()</div><div class="cell">打电话把自己的名字擦掉</div></div>
+      <div class="row"><div class="cell">临界区</div><div class="cell"><b>真正在用会议室</b>那段时间（不变量：同时只能一个人在里面）</div></div>
+    </div>
+  </section>
+
+  <!-- ============ SIMULATION ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">02</span><div>
+      <h2>把戏法拆开：三个人抢一间会议室</h2>
+      <p style="margin:0;color:var(--muted)">点 <b>播放</b> 或 <b>单步</b>，看 A、B、C 怎么排队、怎么撞车、怎么被 <code>ErrVersion</code> 挡回去。</p>
+    </div></div>
+
+    <div class="sim">
+      <!-- server -->
+      <div class="server" id="server">
+        <div class="srv-top">
+          <span class="srv-title">KV Server · 前台台账（全场唯一）</span>
+          <span class="mu-badge">🔒 kv.mu · 每次只处理一个读/写</span>
+        </div>
+        <div class="ledger">
+          <div class="lb">key</div>
+          <div class="full" style="grid-column:2/3"><span class="lv" style="font-size:14px">"lock/room"</span></div>
+          <span class="status s-none" id="srv-status" style="justify-self:end">未建立</span>
+
+          <div class="lb">value</div>
+          <div class="full" style="grid-column:2/3"><span id="srv-value" class="chip">∅ 台账还没这行</span></div>
+          <div></div>
+
+          <div class="lb">version</div>
+          <div class="full" style="grid-column:2/3"><span class="lv" id="srv-version">∅</span></div>
+          <div></div>
+        </div>
+
+        <div class="room-row">
+          <div class="room" id="room">
+            <div class="lb">会议室 · 临界区</div>
+            <div class="occ" id="room-occ"><span class="dot" style="background:var(--muted)"></span>空 · 没人使用</div>
+          </div>
+          <div class="safe">
+            <div class="badge" id="safe-badge">✓ 安全</div>
+            <div class="sub">全程最多 1 人占用 —— 从未双重预订</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- clients -->
+      <div class="clients">
+        <div class="client" id="c-A" style="--cc:var(--cA)">
+          <div class="name"><span class="dot"></span>Client A</div>
+          <span class="pill st-think" id="pill-A">没在用</span>
+          <div class="note" id="note-A">还没想订会议室。</div>
+        </div>
+        <div class="client" id="c-B" style="--cc:var(--cB)">
+          <div class="name"><span class="dot"></span>Client B</div>
+          <span class="pill st-think" id="pill-B">没在用</span>
+          <div class="note" id="note-B">还没想订会议室。</div>
+        </div>
+        <div class="client" id="c-C" style="--cc:var(--cC)">
+          <div class="name"><span class="dot"></span>Client C</div>
+          <span class="pill st-think" id="pill-C">没在用</span>
+          <div class="note" id="note-C">还没想订会议室。</div>
+        </div>
+      </div>
+
+      <!-- controls -->
+      <div class="controls">
+        <button class="primary" id="btn-play">▶ 播放</button>
+        <button id="btn-step">单步 ›</button>
+        <button id="btn-reset">↺ 重来</button>
+        <span class="speed">速度<input type="range" id="speed" min="500" max="2200" value="1400" step="100"></span>
+        <span class="prog" id="prog">第 0 / 14 步</span>
+      </div>
+
+      <div class="logwrap">
+        <ul class="log" id="log"><li class="empty">点「播放」开始 —— 这里会逐条打出每一次 Get / Put 和它的结果。</li></ul>
+      </div>
+    </div>
+
+    <div class="keyline" style="margin-top:20px">
+      <b>整段戏的高潮在第 8–9 步：</b> B 和 C 都 <code>Get</code> 到「空闲，version=2」，都以为能订。两人同时发 <code>Put(..., version=2)</code>。服务器靠 <code>kv.mu</code> <b>一次只处理一个</b>：B 先到，写成功，version 变 3；C 的 <code>Put(version=2)</code> 到时版本已经是 3，<b>对不上 → <span class="accent">ErrVersion</span></b>，抢锁失败，只能重新 <code>Get</code> 再来。这就是分布式锁的全部魔法。</div>
+  </section>
+
+  <!-- ============ STATE MACHINE ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">03</span><div>
+      <h2>锁的状态机</h2>
+      <p style="margin:0;color:var(--muted)">锁的"真身"就是台账上那个 key。它只有三种状态。</p>
+    </div></div>
+    <div class="smwrap">
+      <svg viewBox="0 0 720 300" role="img" aria-label="锁 key 的状态机：不存在、空闲、被占用之间的转换">
+        <defs>
+          <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+            <path d="M0,0 L9,4.5 L0,9 Z" fill="var(--muted)"/></marker>
+          <marker id="ah-ok" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+            <path d="M0,0 L9,4.5 L0,9 Z" fill="var(--free)"/></marker>
+          <marker id="ah-err" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+            <path d="M0,0 L9,4.5 L0,9 Z" fill="var(--err)"/></marker>
+        </defs>
+
+        <!-- boxes -->
+        <g><rect class="sm-box none" x="24" y="118" width="176" height="64" rx="12"/>
+          <text class="sm-t" x="112" y="146" text-anchor="middle">∅ 不存在</text>
+          <text class="sm-s" x="112" y="166" text-anchor="middle">Get → ErrNoKey</text></g>
+
+        <g><rect class="sm-box free" x="300" y="30" width="176" height="64" rx="12"/>
+          <text class="sm-t" x="388" y="58" text-anchor="middle">空闲 (free)</text>
+          <text class="sm-s" x="388" y="78" text-anchor="middle">value="" · version=v</text></g>
+
+        <g><rect class="sm-box held" x="300" y="206" width="176" height="64" rx="12"/>
+          <text class="sm-t" x="388" y="234" text-anchor="middle">被占用 (held)</text>
+          <text class="sm-s" x="388" y="254" text-anchor="middle">value="谁" · version=v</text></g>
+
+        <!-- ∅ -> held (create) -->
+        <path class="sm-edge ok" d="M200,168 C250,200 268,224 296,232" marker-end="url(#ah-ok)"/>
+        <text class="sm-lab ok" x="150" y="212">Put(me,0) OK · 建行并订下</text>
+
+        <!-- free -> held (acquire win) -->
+        <path class="sm-edge ok" d="M372,94 L372,204" marker-end="url(#ah-ok)"/>
+        <text class="sm-lab ok" x="384" y="140">Put(me,v) OK</text>
+        <text class="sm-lab ok" x="384" y="158">抢到（赢家）</text>
+
+        <!-- held -> free (release) -->
+        <path class="sm-edge" d="M404,204 L404,96" marker-end="url(#ah)"/>
+        <text class="sm-lab n" x="416" y="150" text-anchor="start">Release:</text>
+        <text class="sm-lab n" x="416" y="168" text-anchor="start">Put("",v) OK</text>
+
+        <!-- free self loop (ErrVersion retry) -->
+        <path class="sm-edge err" d="M330,36 C300,4 476,4 448,36" marker-end="url(#ah-err)"/>
+        <text class="sm-lab err" x="388" y="16" text-anchor="middle">Put(me,v) → ErrVersion：被人抢先，重新 Get 再试</text>
+      </svg>
+    </div>
+  </section>
+
+  <!-- ============ MU vs LOCK ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">04</span><div>
+      <h2>两种"锁"别搞混</h2>
+      <p style="margin:0;color:var(--muted)">名字都叫锁，层次完全不同。这是最容易绕晕的点。</p>
+    </div></div>
+
+    <div class="cmp">
+      <div class="card a">
+        <div class="tag">server.go 内部</div>
+        <h3>kv.mu · sync.Mutex</h3>
+        <dl>
+          <dt>范围</dt><dd>单个进程内（server 内部）</dd>
+          <dt>保护</dt><dd>那个 <code>KVStore</code> map，防止 server 里多个 goroutine 同时改导致数据竞争</dd>
+          <dt>时长</dt><dd>微秒级 —— 只在一次 <code>Get</code>/<code>Put</code> 执行期间</dd>
+          <dt>实现</dt><dd>Go 原生 <code>sync.Mutex</code>（共享内存）</dd>
+          <dt>谁看得见</dt><dd>只有 server 内部 goroutine</dd>
+        </dl>
+      </div>
+      <div class="card b">
+        <div class="tag">lock/lock.go · 你要实现的</div>
+        <h3>分布式 Lock</h3>
+        <dl>
+          <dt>范围</dt><dd>跨进程 / 跨机器</dd>
+          <dt>保护</dt><dd>应用层临界区（如"用会议室""读写 key l0"这段逻辑）</dd>
+          <dt>时长</dt><dd>长 —— 整个临界区，可能横跨很多次操作</dd>
+          <dt>实现</dt><dd>没有共享内存，只能靠 <b>versioned Put</b> 拼出来</dd>
+          <dt>谁看得见</dt><dd>所有 client（都读同一个 key）</dd>
+        </dl>
+      </div>
+    </div>
+
+    <div class="keyline">
+      <code>kv.mu</code> 保证「往台账上<b>写一次</b>是原子的」（不会两人同时涂改把台账弄成乱码）；分布式 <code>Lock</code> 保证「<b>同一时刻只有一个人在用会议室</b>」。前者是后者的<b>地基</b>——正因为每次带版本检查的 <code>Put</code> 是原子的，你才能用它拼出更高层的互斥。你写 <code>Acquire</code>/<code>Release</code> 时<b>根本不会碰到 <code>kv.mu</code></b>，你用的是 <code>ck.Put</code> / <code>ck.Get</code>。</div>
+  </section>
+
+  <footer class="foot">
+    <p style="max-width:66ch"><b>还有个坑（unreliable 测试）：</b> 网络会丢包，<code>Put</code> 可能返回 <code>ErrMaybe</code>——"也许成功了也许没有"。所以给每把锁生成一个<b>唯一 ID</b> 当 value，遇到 <code>ErrMaybe</code> 就再 <code>Get</code> 一下：读回来是我的 ID，就说明其实抢到了。<code>Release</code> 同理要能认出"这把锁确实是我持有的"。</p>
+    <p>对应文件：<code>src/kvsrv1/lock/lock.go</code>（要改）· <code>server.go</code>（versioned Put 已给）· <code>client.go</code>（Get/Put + 重试）</p>
+  </footer>
+
+</div>
+</div>
+
+<script>
+(function(){
+  var clientColor={A:'var(--cA)',B:'var(--cB)',C:'var(--cC)'};
+  var state, step, timer, done;
+  var pendingTimeouts=[];
+
+  function initState(){
+    return {
+      srv:{exists:false,value:'',version:0},
+      cs:{A:'THINKING',B:'THINKING',C:'THINKING'},
+      note:{A:'还没想订会议室。',B:'还没想订会议室。',C:'还没想订会议室。'}
+    };
+  }
+
+  // each step mutates `state` and returns a log entry {who,txt,kind,act,hit}
+  var steps=[
+    function(){ state.cs.A='ACQUIRING'; state.note.A='想订会议室，开始 Acquire。';
+      return {who:'A',txt:'Acquire 开始 → 先 Get("lock/room")',kind:'info',act:'A'}; },
+    function(){ state.note.A='Get 结果 ErrNoKey：台账这行还空白，可以用 version=0 抢。';
+      return {who:'A',txt:'Get → ErrNoKey（台账还没这行）',kind:'info',act:'A',hit:true}; },
+    function(){ state.srv.exists=true; state.srv.value='A'; state.srv.version=1;
+      state.cs.A='HOLDING'; state.note.A='拿到锁，正在用会议室。';
+      return {who:'A',txt:'Put(A, v=0) → OK：台账写上 A，version 变 1，订到了！',kind:'ok',act:'A',hit:true}; },
+    function(){ state.cs.B='ACQUIRING'; state.cs.C='ACQUIRING';
+      state.note.B='也想订，开始 Acquire。'; state.note.C='也想订，开始 Acquire。';
+      return {who:'—',txt:'现在 B 和 C 也想要这间会议室',kind:'info'}; },
+    function(){ state.note.B='Get → 被 A 占用 (v=1)，等一会儿再试。';
+      return {who:'B',txt:'Get → 被 A 占用 (v=1)，等待后重试',kind:'wait',act:'B',hit:true}; },
+    function(){ state.note.C='Get → 被 A 占用 (v=1)，等一会儿再试。';
+      return {who:'C',txt:'Get → 被 A 占用 (v=1)，等待后重试',kind:'wait',act:'C',hit:true}; },
+    function(){ state.srv.value=''; state.srv.version=2; state.cs.A='THINKING';
+      state.note.A='用完了，Release 把名字擦掉。';
+      return {who:'A',txt:'Release: Put("", v=1) → OK：擦掉名字，version 变 2，房间空了',kind:'ok',act:'A',hit:true}; },
+    function(){ state.note.B='Get → 空闲！(v=2) 准备抢。'; state.note.C='Get → 空闲！(v=2) 准备抢。';
+      return {who:'⚡',txt:'B 和 C 同时 Get 到「空闲, version=2」——都以为能订，撞车来了',kind:'info',act:'BC'}; },
+    function(){ state.srv.value='B'; state.srv.version=3; state.cs.B='HOLDING';
+      state.note.B='订到了！正在用会议室。';
+      return {who:'B',txt:'Put(B, v=2) → OK：kv.mu 让 B 先写，version 变 3',kind:'ok',act:'B',hit:true}; },
+    function(){ state.note.C='Put(v=2) → ErrVersion！台账已被改过，抢锁失败，得重新 Get。';
+      return {who:'C',txt:'Put(C, v=2) → ErrVersion ✗：版本已是 3，C 慢一步，必须重来',kind:'err',act:'C',hit:true}; },
+    function(){ state.note.C='Get → 被 B 占用 (v=3)，继续等。';
+      return {who:'C',txt:'Get → 被 B 占用 (v=3)，等待重试',kind:'wait',act:'C',hit:true}; },
+    function(){ state.srv.value=''; state.srv.version=4; state.cs.B='THINKING';
+      state.note.B='用完，Release。';
+      return {who:'B',txt:'Release: Put("", v=3) → OK：version 变 4，房间空了',kind:'ok',act:'B',hit:true}; },
+    function(){ state.srv.value='C'; state.srv.version=5; state.cs.C='HOLDING';
+      state.note.C='终于订到！正在用会议室。';
+      return {who:'C',txt:'Get→空闲(v=4)，Put(C, v=4) → OK：version 变 5，C 终于拿到锁',kind:'ok',act:'C',hit:true}; },
+    function(){ state.srv.value=''; state.srv.version=6; state.cs.C='THINKING';
+      state.note.C='用完，Release，全部结束。';
+      return {who:'✓',txt:'C Release → version 6。全程会议室从未被两人同时占用——互斥成立。',kind:'ok',act:'C',hit:true}; }
+  ];
+
+  var $=function(id){return document.getElementById(id);};
+  var pillText={THINKING:'没在用',ACQUIRING:'抢锁中…',HOLDING:'持有 · 用会议室'};
+  var pillClass={THINKING:'st-think',ACQUIRING:'st-acq',HOLDING:'st-hold'};
+
+  function render(){
+    var s=state;
+    // server value chip
+    var vEl=$('srv-value');
+    if(!s.srv.exists){ vEl.innerHTML='∅ 台账还没这行'; }
+    else if(s.srv.value===''){ vEl.innerHTML='<span class="dot" style="background:var(--free)"></span>"" · 空闲'; }
+    else { vEl.innerHTML='<span class="dot" style="background:'+clientColor[s.srv.value]+'"></span>"'+s.srv.value+'" · Client '+s.srv.value+' 持有'; }
+    // version
+    $('srv-version').textContent = s.srv.exists ? s.srv.version : '∅';
+    // status
+    var st=$('srv-status');
+    if(!s.srv.exists){ st.className='status s-none'; st.textContent='未建立'; }
+    else if(s.srv.value===''){ st.className='status s-free'; st.textContent='空闲'; }
+    else { st.className='status s-held'; st.textContent='被占用'; }
+    // room
+    var occ=$('room-occ'), room=$('room');
+    if(!s.srv.exists || s.srv.value===''){
+      occ.innerHTML='<span class="dot" style="background:var(--muted)"></span>空 · 没人使用';
+      room.style.background='var(--surface-2)'; room.style.borderColor='var(--line)';
+    } else {
+      occ.innerHTML='<span class="dot" style="background:'+clientColor[s.srv.value]+'"></span>Client '+s.srv.value+' 正在使用';
+      room.style.background='color-mix(in srgb,'+clientColor[s.srv.value]+' 12%, var(--surface-2))';
+      room.style.borderColor=clientColor[s.srv.value];
+    }
+    // clients
+    ['A','B','C'].forEach(function(c){
+      var p=$('pill-'+c); p.className='pill '+pillClass[s.cs[c]]; p.textContent=pillText[s.cs[c]];
+      $('note-'+c).textContent=s.note[c];
+    });
+    $('prog').textContent='第 '+step+' / '+steps.length+' 步';
+  }
+
+  function clearFx(){
+    $('server').classList.remove('hit');
+    ['A','B','C'].forEach(function(c){$('c-'+c).classList.remove('act');});
+  }
+  function flash(entry){
+    clearFx();
+    if(entry.hit) $('server').classList.add('hit');
+    if(entry.act){
+      var list = entry.act==='BC' ? ['B','C'] : [entry.act];
+      list.forEach(function(c){ if($('c-'+c)) $('c-'+c).classList.add('act'); });
+    }
+    var t=setTimeout(clearFx,700); pendingTimeouts.push(t);
+  }
+  function addLog(e){
+    var log=$('log');
+    var empty=log.querySelector('.empty'); if(empty) log.innerHTML='';
+    var li=document.createElement('li'); li.className=e.kind;
+    var who=document.createElement('span'); who.className='who'; who.textContent=e.who;
+    if(e.who==='A')who.style.color='var(--cA)'; if(e.who==='B')who.style.color='var(--cB)'; if(e.who==='C')who.style.color='var(--cC)';
+    var txt=document.createElement('span'); txt.className='txt'; txt.textContent=e.txt;
+    li.appendChild(who); li.appendChild(txt); log.appendChild(li);
+    log.scrollTop=log.scrollHeight;
+  }
+
+  function advance(){
+    if(step>=steps.length){ stopPlay(); done=true; $('btn-step').disabled=true; return; }
+    var e=steps[step](); step++;
+    render(); flash(e); addLog(e);
+    if(step>=steps.length){ done=true; $('btn-step').disabled=true; stopPlay(); }
+  }
+
+  function stopPlay(){ if(timer){clearInterval(timer); timer=null;} $('btn-play').textContent='▶ 播放'; }
+  function startPlay(){
+    if(done) reset();
+    var ms=2700-parseInt($('speed').value,10); // higher slider = faster
+    advance();
+    timer=setInterval(function(){ if(step>=steps.length){stopPlay();return;} advance(); }, ms);
+    $('btn-play').textContent='⏸ 暂停';
+  }
+  function reset(){
+    stopPlay(); pendingTimeouts.forEach(clearTimeout); pendingTimeouts=[];
+    state=initState(); step=0; done=false; clearFx();
+    $('btn-step').disabled=false;
+    $('log').innerHTML='<li class="empty">点「播放」开始 —— 这里会逐条打出每一次 Get / Put 和它的结果。</li>';
+    render();
+  }
+
+  $('btn-play').addEventListener('click',function(){ if(timer) stopPlay(); else startPlay(); });
+  $('btn-step').addEventListener('click',function(){ stopPlay(); if(done) reset(); advance(); });
+  $('btn-reset').addEventListener('click',reset);
+  $('speed').addEventListener('input',function(){ if(timer){ stopPlay(); startPlay(); } });
+
+  reset();
+})();
+</script>
