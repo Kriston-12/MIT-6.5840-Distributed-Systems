@@ -134,3 +134,108 @@ R1 -> mr-out-1
 
 The complete job output is the union of all `mr-out-*` files.
 
+---
+
+# Lab2 Key/Value Server & Lock (kvsrv1)
+
+## Result
+
+```text
+ok  6.5840/kvsrv1        # incl. many-client race + unreliable network
+ok  6.5840/kvsrv1/lock   # 1 & 10 clients, reliable + unreliable network
+```
+
+A single key/value server with **versioned Put**, a Clerk that survives dropped
+messages, and a distributed lock built entirely on top of the Clerk.
+
+## Architecture
+
+```text
+client (goroutine, id=me) ──1:1── clerk ──1:N── Lock objects
+                                                  │  (each wraps one lockname)
+   N clients' Lock(name) objects ────────────────┘
+                       └──────► converge on ONE key "name" on the single server
+```
+
+- **1** server (this lab is single-node; replication is a later lab).
+- **N** clients, each with **1** clerk (its RPC proxy); one clerk can back many locks.
+- A **lock** is identified by `lockname` (a key). N clients contend on the *same key* — that
+  is where mutual exclusion happens, not on the in-memory `*Lock` objects.
+
+## Core primitive: versioned Put
+
+The server owns a monotonic `version` per key and updates conditionally. This single
+compare-and-swap is what everything else is built on.
+
+| Return | Meaning |
+| --- | --- |
+| `OK` | write applied, `version++` |
+| `ErrVersion` | supplied version ≠ stored version → **not** applied |
+| `ErrNoKey` (Get) | key was never created |
+| `ErrMaybe` (Clerk only) | a *resent* Put hit `ErrVersion` → maybe applied, maybe not |
+
+`Put(k, v, 0)` creates a key only if it doesn't exist; any other version on a missing key is `ErrNoKey`.
+
+## Clerk: surviving dropped messages
+
+`Call()` returns `false` on timeout (request **or** reply lost — indistinguishable).
+The Clerk retries until it gets a reply. Get is idempotent; Put needs care:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Send
+    Send --> Send: no reply, mark retried
+    Send --> Return: OK / ErrNoKey / first-try ErrVersion
+    Send --> Maybe: ErrVersion AND already retried
+    Return --> [*]
+    Maybe --> [*]: return ErrMaybe
+```
+
+The at-most-once guarantee needs **no per-client server state** — it falls out of the
+version check plus the client remembering whether it retried. The price is `ErrMaybe`.
+
+## Lock: Acquire
+
+Each `*Lock` holds a unique `holderID` (`RandValue`, set once in `MakeLock`). One `for`
+loop; every non-OK Put just loops back to `Get`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Get
+    Get --> Acquired: val == holderID
+    Get --> Create: ErrNoKey
+    Get --> Grab: val empty = free
+    Get --> Wait: val == other = held
+    Create --> Acquired: Put id,0 OK
+    Create --> Get: ErrVersion / ErrMaybe
+    Grab --> Acquired: Put id,ver OK
+    Grab --> Get: ErrVersion / ErrMaybe
+    Wait --> Get: sleep, retry
+    Acquired --> [*]
+```
+
+## Lock: Release
+
+The holder is the only writer, so no loop and no genuine `ErrVersion`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Get
+    Get --> Free: val == holderID
+    Get --> Released: val != holderID = already freed
+    Free --> Released: Put empty,ver OK or ErrMaybe
+    Released --> [*]
+```
+
+## Key points & easily-confused spots
+
+| Point | Detail |
+| --- | --- |
+| **version vs value** | `version` (CAS) is what enforces mutual exclusion. `value` (=`holderID`) only *identifies* the holder. |
+| **why unique holderID** | Needed **only** to resolve `ErrMaybe`: after an ambiguous Put, re-`Get` and check `val == holderID`. A collision would let the `val==holderID` shortcut misfire → double-hold. |
+| **two axes of uniqueness** | `lockname` (key): unique *across different locks*, **shared** across contenders. `holderID` (value): unique *across contenders of the same lock*. |
+| **`val == ""`** | The only writer of `""` is `Release`, so `val==""` means "created, then released → free". |
+| **Release ≠ ErrVersion** | While you hold the lock nobody else writes the key, so its version can't change between Release's Get and Put. Only `OK`/`ErrMaybe` occur — both mean released. |
+| **`kv.mu` vs the Lock** | `kv.mu` is an in-process mutex guarding the map for microseconds. The distributed Lock is cross-process, built on versioned Put, held for the whole critical section. `kv.mu` makes each Put atomic; the Lock composes those atomic Puts into higher-level exclusion. |
+| **lock key ≠ protected data** | The `lockname` key stores only lock state (holder / free). Application data lives under *other* keys (e.g. `"l0"` in the test); the lock just gates who may touch them. |
+
